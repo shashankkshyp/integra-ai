@@ -91,13 +91,23 @@ npm install --legacy-peer-deps
 
 ### 3. Configure environment variables
 
-Create a local environment file:
+Create a local environment file from the tracked template:
 
-```bash
-cp .env.example .env.local
+**Windows PowerShell:**
+
+```powershell
+Copy-Item .\env.example .env.local
 ```
 
-If the repository does not contain an `.env.example`, create `.env.local` yourself and use the variable names documented in the README and the relevant source files.
+**macOS / Linux:**
+
+```bash
+cp env.example .env.local
+```
+
+Update the placeholders with your own development credentials. Configure only the service credentials required for the features you intend to use.
+
+Keep `.env.local` private and never commit it. Variables prefixed with `NEXT_PUBLIC_` are exposed to the browser, so never place secrets in them.
 
 Depending on the features you run, the application may require credentials for services such as:
 
