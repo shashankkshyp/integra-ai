@@ -10,6 +10,7 @@ Integra.AI is an AI-powered video meeting platform. It combines real-time video 
 - [Before you start](#before-you-start)
 - [Finding an issue](#finding-an-issue)
 - [Set up the project](#set-up-the-project)
+- [Meeting Event and Summary Processing Lifecycle](#meeting-event-and-summary-processing-lifecycle)
 - [Development guidelines](#development-guidelines)
 - [Working on an issue](#working-on-an-issue)
 - [Commit and pull request guidelines](#commit-and-pull-request-guidelines)
@@ -147,6 +148,72 @@ npm run db:studio
 ```
 
 Use database commands only when your assigned task requires them. Be careful to use a development database—not production data.
+
+## Meeting Event and Summary Processing Lifecycle
+
+### A. Architecture overview
+
+Stream sends call webhooks to the Next.js handler at `src/app/api/webhook/route.ts`. The handler verifies the webhook signature with the Stream Video SDK and updates the meeting record in the database. When Stream reports that a transcription is ready, the handler stores its URL and sends a `meetings/processing` event to Inngest. The Inngest endpoint at `src/app/api/inngest/route.ts` registers the `meetingsProcessing` function from `src/inngest/functions.ts`, which fetches the transcript, generates a summary, and saves it to the meeting record.
+
+The transcript itself is fetched from Stream's transcript URL when needed; the application stores the URL in `meetings.transcriptUrl`. The generated summary is stored in `meetings.summary` (`src/db/schema.ts`).
+
+### B. Event sequence
+
+1. A user joins a live meeting. Stream sends `call.session_started`; the webhook changes an eligible upcoming meeting to `active` and records `startedAt`.
+2. When the call ends, Stream sends `call.session_ended`. The webhook changes the meeting from `active` to `processing` and records `endedAt`. This marks the call as ended; it does **not** mean the transcript is ready.
+3. Stream separately sends `call.transcription_ready` when transcription is ready. The webhook reads `call_transcription.url`, stores it in `meetings.transcriptUrl`, then sends Inngest the `meetings/processing` event with the meeting ID and transcript URL.
+4. The `meetingsProcessing` function in `src/inngest/functions.ts` fetches the URL, parses its JSONL transcript, attaches known speaker names from the user and agent records (using “Unknown” when a speaker is not found), and asks the `gpt-4o` summarizer to generate the summary.
+5. After summary generation, the function saves the result to `meetings.summary` and changes the meeting status to `completed`. Transcript display separately fetches and parses the saved transcript URL through `getTranscript` in `src/modules/meetings/server/procedures.ts`.
+
+The webhook does not check that the transcription URL is usable before saving it and dispatching the event. If transcript retrieval, parsing, or summary generation fails, the function does not mark the meeting completed or set a separate failure status; it can remain `processing`. See `src/app/api/webhook/route.ts`, `src/inngest/functions.ts`, and `src/modules/meetings/server/procedures.ts` for these paths.
+
+### C. Local development prerequisites
+
+For the meeting-to-summary path, configure a local `.env.local` using placeholders from `env.example`:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Connects the application to its PostgreSQL database for meeting, user, and agent records. |
+| `NEXT_PUBLIC_STREAM_VIDEO_API_KEY` | Stream Video API key used by the application. |
+| `STREAM_VIDEO_SECRET_KEY` | Server-side Stream Video secret, including webhook signature verification. |
+| `OPENAI_API_KEY` | Used by the meeting agent and the summary generator. |
+
+Use your own development configuration; do not put production credentials or real secrets in documentation or source control. The local services for this workflow are the Next.js application, an ngrok tunnel for Stream webhooks, and the Inngest development server. To participate through the application, also configure any sign-in provider credentials required by your local auth setup.
+
+`env.example` also includes `INNGEST_SIGNING_KEY` for Inngest signing. The local workflow uses the Inngest development server below; do not use a production signing key just to run it locally.
+
+The available commands are:
+
+```bash
+npm run dev
+npm run dev:webhook
+npx inngest-cli@latest dev
+```
+
+`npm run dev:webhook` forwards port `3000` using the ngrok URL configured in the `dev:webhook` script in `package.json`. Configure your own ngrok URL there. The URL must match the host configured as the Stream webhook destination; use `https://<your-ngrok-host>/api/webhook` as the destination. Do not copy a URL from another developer's configuration.
+
+### D. Startup order
+
+1. Copy `env.example` to `.env.local` and fill in the development values needed for your database, Stream Video, and OpenAI setup.
+2. Start the Next.js application with `npm run dev` (the webhook script forwards port `3000`).
+3. Start the ngrok tunnel with `npm run dev:webhook`, after configuring its URL in the script as described above.
+4. Configure or verify the Stream webhook destination is `https://<your-ngrok-host>/api/webhook` and uses the same ngrok host as the forwarding script.
+5. Start the Inngest development server with `npx inngest-cli@latest dev` so it can connect to the application's `/api/inngest` endpoint.
+6. Join and end a meeting, then allow Stream to deliver the separate transcription-ready event. Check the meeting for its transcript and, after processing completes, its summary.
+
+### E. Troubleshooting
+
+| Symptom | What to check | Relevant source/service |
+|---|---|---|
+| Meeting ends but status does not update | Confirm Stream delivered `call.session_ended`, the webhook request was accepted, and the meeting was `active` (only active meetings are changed to `processing`). | Stream webhook delivery; `src/app/api/webhook/route.ts` |
+| Transcript-ready event arrives without a usable transcript URL | Check that `call_transcription.url` is present and usable. The webhook stores and forwards this value without validating it first. | Stream transcription event; `src/app/api/webhook/route.ts` |
+| Transcript does not appear | Check `meetings.transcriptUrl` and whether the URL returns parseable JSONL. The transcript query returns an empty list when the URL is absent or its fetch/parse fails. | `src/db/schema.ts`; `getTranscript` in `src/modules/meetings/server/procedures.ts` |
+| Inngest development server is not running | Start it with `npx inngest-cli@latest dev` and make sure the application is running. | Inngest development server; `src/app/api/inngest/route.ts` |
+| Inngest event is not received | Verify the webhook accepted `call.transcription_ready`, saved the URL, and sent `meetings/processing`; check the Inngest development server and registered function. | `src/app/api/webhook/route.ts`; `src/app/api/inngest/route.ts`; Inngest development server |
+| Summary processing fails | Check transcript fetching and JSONL parsing, database access for speakers, and OpenAI configuration; inspect the `meetingsProcessing` run and application output. | `src/inngest/functions.ts`; Inngest development server; Next.js terminal |
+| Meeting remains in processing state | Confirm `call.transcription_ready` arrived and the `meetingsProcessing` function reached its `save-summary` step. There is no separate failure-status update in the current flow. | `src/app/api/webhook/route.ts`; `src/inngest/functions.ts`; meeting record |
+| Local webhook URL is incorrect | Ensure the URL configured in `dev:webhook` is the same ngrok host as the Stream webhook destination, with `/api/webhook` appended to the destination. | `package.json`; ngrok configuration; Stream webhook configuration |
+| Stream credentials or webhook configuration are invalid | Check the local Stream API key and server secret, the configured webhook destination, and that requests include the required signature and API-key headers. The handler verifies the signature with the Stream SDK. | `env.example`; `src/lib/stream-video.ts`; `src/app/api/webhook/route.ts`; Stream configuration |
 
 ## Development guidelines
 
